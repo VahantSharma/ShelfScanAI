@@ -1,0 +1,55 @@
+# ── Data (immutable, never commit) ──
+data/raw/
+data/processed/
+data/reference_library/index.faiss
+data/reference_library/embeddings.npy
+data/reference_library/crops/
+data/test_pairs/public/images/
+
+# ── Model artifacts ──
+*.pt
+*.onnx
+*.engine
+*.tflite
+artifacts/models/
+artifacts/benchmarks/*.json
+artifacts/error_analysis/*.json
+artifacts/runs/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Virtual environments ──
+.venv/
+venv/
+env/
+.env
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Jupyter ──
+.ipynb_checkpoints/
+
+# ── Experiment tracking ──
+wandb/
+mlruns/
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Docker ──
+docker-compose.override.yml

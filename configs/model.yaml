@@ -1,0 +1,7 @@
+detection_model: yolov8m
+clip_model: ViT-B-32
+clip_pretrained: openai
+alignment_method: orb  # "orb", "sift", "loftr" (v2)
+onnx_opset: 17
+onnx_simplify: true
+onnx_dynamic: false

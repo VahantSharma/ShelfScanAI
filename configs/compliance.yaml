@@ -1,0 +1,9 @@
+weights:
+  presence: 0.5
+  facings: 0.3
+  correctness: 0.2
+
+thresholds:
+  min_confidence: 0.6
+  position_tolerance: 0.1
+  iou_threshold: 0.5
