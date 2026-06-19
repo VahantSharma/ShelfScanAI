@@ -70,12 +70,17 @@ def setup_wandb(config: TrainingConfig, run_name: str | None = None) -> None:
     logger.info("W&B run initialized: %s", wandb.run.url)
 
 
-def train(config: TrainingConfig, dataset_yaml: Path) -> dict[str, float]:
+def train(
+    config: TrainingConfig,
+    dataset_yaml: Path,
+    run_name: str | None = None,
+) -> dict[str, float]:
     """Run YOLOv8 training.
 
     Args:
         config: Training hyperparameters.
         dataset_yaml: Path to Ultralytics dataset YAML.
+        run_name: Optional W&B run name override.
 
     Returns:
         Dict with final metrics (mAP50, mAP50-95, precision, recall).
@@ -83,7 +88,7 @@ def train(config: TrainingConfig, dataset_yaml: Path) -> dict[str, float]:
     from ultralytics import YOLO
 
     # Initialize W&B
-    setup_wandb(config)
+    setup_wandb(config, run_name)
 
     # Load model
     logger.info("Loading model: %s", config.model)
@@ -185,7 +190,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data",
         type=Path,
-        default=Path("data/processed/SKU110K/dataset.yaml"),
+        default=Path("data/raw/SKU110K/dataset.yaml"),
         help="Path to Ultralytics dataset YAML",
     )
     parser.add_argument(
@@ -202,9 +207,15 @@ if __name__ == "__main__":
     )
 
     config = TrainingConfig.from_yaml(args.config)
-    metrics = train(config, args.data)
 
-    # Find the run directory
-    run_dirs = sorted(Path(config.project).glob("train*"), reverse=True)
-    if run_dirs:
-        save_experiment_artifacts(config, metrics, run_dirs[0])
+    try:
+        metrics = train(config, args.data, args.run_name)
+
+        # Find the run directory
+        run_dirs = sorted(Path(config.project).glob("train*"), reverse=True)
+
+        if run_dirs:
+            save_experiment_artifacts(config, metrics, run_dirs[0])
+
+    except KeyboardInterrupt:
+        logger.warning("Training interrupted by user.")

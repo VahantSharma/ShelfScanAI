@@ -1,9 +1,11 @@
 """
 SKU110K dataset preparation pipeline.
 
-Converts raw SKU110K CSV annotations (absolute pixel coords, single class)
-to YOLO format (normalized xywh, class 0). Validates directory structure,
-logs statistics, and creates dataset YAML for Ultralytics.
+Validates a YOLO-formatted dataset, logs statistics, and creates
+an Ultralytics-compatible dataset YAML.
+
+Designed for the Kaggle SKU110K dataset which already contains
+images/ and labels/ in YOLO format (normalized xywh, class 0).
 
 Usage:
     python -m src.data.prepare --config configs/data.yaml
@@ -11,228 +13,262 @@ Usage:
 
 from __future__ import annotations
 
-import csv
 import logging
-import shutil
+import random
 from pathlib import Path
+
+import yaml
 
 from src.config import DataConfig
 
 logger = logging.getLogger(__name__)
 
-# SKU110K CSV columns: image_path, x_min, y_min, x_max, y_max, class
-EXPECTED_CSV_COLUMNS = ["image_path", "x_min", "y_min", "x_max", "y_max", "class"]
-
 SPLITS = ["train", "val", "test"]
 
 
 def validate_raw_directory(raw_dir: Path) -> bool:
-    """Validate that raw SKU110K directory has expected structure.
+    """Validate that raw SKU110K directory has expected YOLO structure.
 
     Expected:
         raw_dir/
         ├── images/{train,val,test}/
-        └── annotations/{train,val,test}.csv
+        └── labels/{train,val,test}/
 
     Returns:
         True if structure is valid, False otherwise.
     """
     images_dir = raw_dir / "images"
-    annotations_dir = raw_dir / "annotations"
+    labels_dir = raw_dir / "labels"
 
     if not images_dir.exists():
         logger.error("Missing images directory: %s", images_dir)
         return False
-    if not annotations_dir.exists():
-        logger.error("Missing annotations directory: %s", annotations_dir)
+    if not labels_dir.exists():
+        logger.error("Missing labels directory: %s", labels_dir)
         return False
 
     for split in SPLITS:
         split_img_dir = images_dir / split
-        csv_path = annotations_dir / f"{split}.csv"
+        split_lbl_dir = labels_dir / split
 
         if not split_img_dir.exists():
             logger.error("Missing image split directory: %s", split_img_dir)
             return False
-        if not csv_path.exists():
-            logger.error("Missing annotation CSV: %s", csv_path)
+        if not split_lbl_dir.exists():
+            logger.error("Missing label split directory: %s", split_lbl_dir)
             return False
 
     logger.info("Raw directory structure validated: %s", raw_dir)
     return True
 
 
-def parse_sku110k_csv(csv_path: Path) -> list[dict[str, str | float]]:
-    """Parse SKU110K CSV annotation file.
+def validate_label_format(label_path: Path) -> bool:
+    """Validate a single YOLO label file.
 
-    Each row: image_path, x_min, y_min, x_max, y_max, class
-
-    Returns:
-        List of annotation dicts.
-    """
-    annotations = []
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            annotations.append(
-                {
-                    "image_path": row["image_path"],
-                    "x_min": float(row["x_min"]),
-                    "y_min": float(row["y_min"]),
-                    "x_max": float(row["x_max"]),
-                    "y_max": float(row["y_max"]),
-                }
-            )
-    return annotations
-
-
-def convert_csv_to_yolo(
-    csv_path: Path, images_dir: Path, output_label_dir: Path
-) -> dict[str, int]:
-    """Convert SKU110K CSV annotations to YOLO format.
-
-    YOLO format: class x_center y_center width height (all normalized 0-1).
+    Checks:
+        - Each line has exactly 5 space-separated fields
+        - Class ID is 0
+        - x_center, y_center, width, height are all between 0 and 1
 
     Returns:
-        Dict with statistics: total_images, total_bboxes, empty_labels.
+        True if format is valid, False otherwise.
     """
-    annotations = parse_sku110k_csv(csv_path)
-    output_label_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(label_path) as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) != 5:
+                    logger.error(
+                        "Invalid label format at %s line %d: expected 5 fields, got %d",
+                        label_path.name,
+                        line_num,
+                        len(parts),
+                    )
+                    return False
 
-    # Group by image
-    image_bboxes: dict[str, list[dict]] = {}
-    for ann in annotations:
-        img_name = Path(ann["image_path"]).name
-        if img_name not in image_bboxes:
-            image_bboxes[img_name] = []
-        image_bboxes[img_name].append(ann)
+                cls = int(parts[0])
+                if cls != 0:
+                    logger.error(
+                        "Unexpected class ID %d at %s line %d (expected 0)",
+                        cls,
+                        label_path.name,
+                        line_num,
+                    )
+                    return False
 
-    stats = {"total_images": 0, "total_bboxes": 0, "empty_labels": 0}
+                for i, val_str in enumerate(parts[1:], 1):
+                    val = float(val_str)
+                    if not (0.0 <= val <= 1.0):
+                        logger.error(
+                            "Value %f out of range [0,1] at %s line %d field %d",
+                            val,
+                            label_path.name,
+                            line_num,
+                            i + 1,
+                        )
+                        return False
+        return True
+    except Exception as e:
+        logger.error("Failed to validate %s: %s", label_path, e)
+        return False
 
-    for img_name, bboxes in image_bboxes.items():
-        # Find actual image to get dimensions
-        img_path = images_dir / img_name
-        if not img_path.exists():
-            logger.warning("Image not found, skipping: %s", img_path)
-            continue
 
-        # Use PIL to get image dimensions
-        from PIL import Image
+def log_dataset_statistics(raw_dir: Path) -> dict[str, dict]:
+    """Compute and log dataset statistics per split.
 
-        with Image.open(img_path) as img:
-            img_w, img_h = img.size
+    Returns:
+        Dict with per-split stats: image_count, label_count, total_bboxes,
+        min_objects, max_objects, mean_objects.
+    """
+    images_dir = raw_dir / "images"
+    labels_dir = raw_dir / "labels"
 
-        label_path = output_label_dir / (Path(img_name).stem + ".txt")
-        lines = []
-        for bbox in bboxes:
-            # Convert absolute pixel coords to normalized xywh
-            x_min, y_min = bbox["x_min"], bbox["y_min"]
-            x_max, y_max = bbox["x_max"], bbox["y_max"]
+    stats = {}
+    for split in SPLITS:
+        img_dir = images_dir / split
+        lbl_dir = labels_dir / split
 
-            x_center = ((x_min + x_max) / 2) / img_w
-            y_center = ((y_min + y_max) / 2) / img_h
-            width = (x_max - x_min) / img_w
-            height = (y_max - y_min) / img_h
+        image_count = len(list(img_dir.glob("*.jpg")))
+        label_count = len(list(lbl_dir.glob("*.txt")))
 
-            # Clamp to [0, 1]
-            x_center = max(0.0, min(1.0, x_center))
-            y_center = max(0.0, min(1.0, y_center))
-            width = max(0.0, min(1.0, width))
-            height = max(0.0, min(1.0, height))
+        # Count bboxes per image
+        bbox_counts = []
+        for label_file in lbl_dir.glob("*.txt"):
+            with open(label_file) as f:
+                count = sum(1 for line in f if line.strip())
+            bbox_counts.append(count)
 
-            # Class 0 for all objects (SKU110K single-class)
-            lines.append(f"0 {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}")
+        total_bboxes = sum(bbox_counts)
+        min_obj = min(bbox_counts) if bbox_counts else 0
+        max_obj = max(bbox_counts) if bbox_counts else 0
+        mean_obj = total_bboxes / len(bbox_counts) if bbox_counts else 0
 
-        with open(label_path, "w") as f:
-            f.write("\n".join(lines))
+        stats[split] = {
+            "image_count": image_count,
+            "label_count": label_count,
+            "total_bboxes": total_bboxes,
+            "min_objects": min_obj,
+            "max_objects": max_obj,
+            "mean_objects": round(mean_obj, 1),
+        }
 
-        stats["total_images"] += 1
-        stats["total_bboxes"] += len(bboxes)
-        if not lines:
-            stats["empty_labels"] += 1
+        logger.info(
+            "Split %s: %d images, %d labels, %d bboxes "
+            "(min=%d, max=%d, mean=%.1f per image)",
+            split,
+            image_count,
+            label_count,
+            total_bboxes,
+            min_obj,
+            max_obj,
+            mean_obj,
+        )
+
+    # Log totals
+    total_images = sum(s["image_count"] for s in stats.values())
+    total_bboxes = sum(s["total_bboxes"] for s in stats.values())
+    logger.info(
+        "Dataset total: %d images, %d bboxes",
+        total_images,
+        total_bboxes,
+    )
 
     return stats
 
 
-def copy_images_to_processed(raw_images_dir: Path, processed_images_dir: Path) -> int:
-    """Copy (or symlink) images from raw to processed directory.
+def verify_image_label_pairs(raw_dir: Path) -> int:
+    """Verify that every image has a corresponding label and vice versa.
 
     Returns:
-        Number of images copied.
+        Number of mismatches found (0 = perfect).
     """
-    processed_images_dir.mkdir(parents=True, exist_ok=True)
-    count = 0
-    for img_path in raw_images_dir.glob("*.jpg"):
-        dest = processed_images_dir / img_path.name
-        if not dest.exists():
-            shutil.copy2(img_path, dest)
-        count += 1
-    return count
+    images_dir = raw_dir / "images"
+    labels_dir = raw_dir / "labels"
 
+    mismatches = 0
 
-def prepare_dataset(config: DataConfig) -> dict[str, dict[str, int]]:
-    """Run full preparation pipeline.
-
-    Converts CSV annotations to YOLO format, copies images, logs statistics.
-
-    Returns:
-        Per-split statistics.
-    """
-    raw_dir = config.raw_dir
-    processed_dir = config.processed_dir
-
-    if not validate_raw_directory(raw_dir):
-        raise FileNotFoundError(
-            f"SKU110K raw directory structure invalid: {raw_dir}\n"
-            "Expected: {raw_dir}/images/{{train,val,test}}/ and "
-            "{raw_dir}/annotations/{{train,val,test}}.csv"
-        )
-
-    all_stats = {}
     for split in SPLITS:
-        logger.info("Processing split: %s", split)
+        img_stems = {p.stem for p in (images_dir / split).glob("*.jpg")}
+        lbl_stems = {p.stem for p in (labels_dir / split).glob("*.txt")}
 
-        csv_path = raw_dir / "annotations" / f"{split}.csv"
-        raw_images_dir = raw_dir / "images" / split
-        processed_images_dir = processed_dir / "images" / split
-        processed_labels_dir = processed_dir / "labels" / split
+        missing_labels = img_stems - lbl_stems
+        missing_images = lbl_stems - img_stems
 
-        # Convert annotations
-        stats = convert_csv_to_yolo(csv_path, raw_images_dir, processed_labels_dir)
+        if missing_labels:
+            logger.warning(
+                "Split %s: %d images without labels (first 5: %s)",
+                split,
+                len(missing_labels),
+                list(missing_labels)[:5],
+            )
+            mismatches += len(missing_labels)
 
-        # Copy images
-        n_copied = copy_images_to_processed(raw_images_dir, processed_images_dir)
-        stats["images_copied"] = n_copied
+        if missing_images:
+            logger.warning(
+                "Split %s: %d labels without images (first 5: %s)",
+                split,
+                len(missing_images),
+                list(missing_images)[:5],
+            )
+            mismatches += len(missing_images)
 
-        all_stats[split] = stats
-        logger.info(
-            "Split %s: %d images, %d bboxes, %d empty",
-            split,
-            stats["total_images"],
-            stats["total_bboxes"],
-            stats["empty_labels"],
-        )
+        if not missing_labels and not missing_images:
+            logger.info("Split %s: all %d images have matching labels", split, len(img_stems))
 
-    # Log summary
-    total_images = sum(s["total_images"] for s in all_stats.values())
-    total_bboxes = sum(s["total_bboxes"] for s in all_stats.values())
-    logger.info("Dataset preparation complete: %d images, %d bboxes", total_images, total_bboxes)
+    return mismatches
 
-    return all_stats
+
+def validate_sample_labels(raw_dir: Path, n_samples: int = 20) -> bool:
+    """Validate a random sample of label files for format correctness.
+
+    Args:
+        raw_dir: Path to raw dataset directory.
+        n_samples: Number of label files to validate.
+
+    Returns:
+        True if all samples are valid, False otherwise.
+    """
+    labels_dir = raw_dir / "labels"
+    all_label_files = list(labels_dir.rglob("*.txt"))
+
+    if not all_label_files:
+        logger.error("No label files found")
+        return False
+
+    sample = random.sample(all_label_files, min(n_samples, len(all_label_files)))
+    invalid = 0
+
+    for label_path in sample:
+        if not validate_label_format(label_path):
+            invalid += 1
+
+    if invalid > 0:
+        logger.error("Format validation failed: %d/%d samples invalid", invalid, len(sample))
+        return False
+
+    logger.info("Format validation passed: %d/%d samples valid", len(sample) - invalid, len(sample))
+    return True
 
 
 def create_dataset_yaml(config: DataConfig) -> Path:
     """Create Ultralytics-compatible dataset YAML.
 
+    The YAML points to the raw directory (which already contains
+    images/ and labels/ in YOLO format).
+
     Returns:
         Path to created YAML file.
     """
-    processed_dir = config.processed_dir
-    yaml_path = processed_dir / "dataset.yaml"
+    raw_dir = config.raw_dir
+    yaml_path = raw_dir / "dataset.yaml"
 
     content = f"""# SKU110K dataset - auto-generated by src/data/prepare.py
 # Single class: "object" (all retail items)
-path: {processed_dir.resolve()}
+# Labels already in YOLO format (normalized xywh, class 0)
+path: {raw_dir.resolve()}
 train: images/train
 val: images/val
 test: images/test
@@ -243,6 +279,43 @@ names: ["object"]
     yaml_path.write_text(content)
     logger.info("Created dataset YAML: %s", yaml_path)
     return yaml_path
+
+
+def prepare_dataset(config: DataConfig) -> dict[str, dict]:
+    """Run full preparation pipeline.
+
+    Validates directory structure, verifies label format,
+    logs statistics, and creates dataset.yaml.
+
+    Returns:
+        Per-split statistics.
+    """
+    raw_dir = config.raw_dir
+
+    # Step 1: Validate directory structure
+    if not validate_raw_directory(raw_dir):
+        raise FileNotFoundError(
+            f"SKU110K directory structure invalid: {raw_dir}\n"
+            "Expected: {raw_dir}/images/{{train,val,test}}/ and "
+            "{raw_dir}/labels/{{train,val,test}}/"
+        )
+
+    # Step 2: Verify image-label pairs
+    mismatches = verify_image_label_pairs(raw_dir)
+    if mismatches > 0:
+        logger.warning("Found %d image-label mismatches (proceeding anyway)", mismatches)
+
+    # Step 3: Validate label format (sample)
+    if not validate_sample_labels(raw_dir, n_samples=20):
+        logger.warning("Some labels failed format validation (proceeding anyway)")
+
+    # Step 4: Log statistics
+    stats = log_dataset_statistics(raw_dir)
+
+    # Step 5: Create dataset.yaml
+    create_dataset_yaml(config)
+
+    return stats
 
 
 if __name__ == "__main__":
@@ -257,8 +330,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
     cfg = DataConfig.from_yaml(args.config)
     prepare_dataset(cfg)
-    create_dataset_yaml(cfg)

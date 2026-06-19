@@ -300,7 +300,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data",
         type=Path,
-        default=Path("data/processed/SKU110K/dataset.yaml"),
+        default=Path("data/raw/SKU110K/dataset.yaml"),
         help="Path to dataset YAML",
     )
     parser.add_argument(

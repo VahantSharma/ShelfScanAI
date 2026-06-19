@@ -1,4 +1,4 @@
 raw_dir: data/raw/SKU110K
-processed_dir: data/processed/SKU110K
+processed_dir: data/raw/SKU110K
 reference_library_dir: data/reference_library
 test_pairs_dir: data/test_pairs
